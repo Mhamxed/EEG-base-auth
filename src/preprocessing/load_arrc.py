@@ -34,6 +34,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
+from collections import Counter
 
 from src.utils.config import ARRC_PATH
 
@@ -135,7 +136,7 @@ def load_arrc(mat_path: Optional[Path] = None, verbose: bool = True) -> pd.DataF
         trial_idx, subject_id, session, stimuli_type,
         arousal_voted, valence_voted, arousal_norm, valence_norm,
         content, cognitive_input, open_closed, ssvep_freq,
-        eeg_data   ← numpy array shape (12, 17, 14) stored as object
+        eeg_data   ← numpy array stored as object (shape may vary per trial)
     """
     path = Path(mat_path) if mat_path else ARRC_PATH
 
@@ -159,8 +160,7 @@ def load_arrc(mat_path: Optional[Path] = None, verbose: bool = True) -> pd.DataF
         entry = DATA[0, i]
 
         # ── EEG tensor ───────────────────────────────────────────────────────
-        eeg = entry["data"][0, 0]               # (12, 17, 14)
-
+        eeg = entry["data"][0, 0]               # typically (12, 17, 14)
         # ── Scalar fields ────────────────────────────────────────────────────
         subject_id = int(entry["y"][0, 0])
         session    = int(entry["session"][0, 0])
@@ -188,7 +188,7 @@ def load_arrc(mat_path: Optional[Path] = None, verbose: bool = True) -> pd.DataF
             "cognitive_input": info_dict["cognitive_input"],
             "open_closed":     info_dict["open_closed"],
             "ssvep_freq":      info_dict["ssvep_freq"],
-            "eeg_data":        eeg,        
+            "eeg_data":        eeg,
         }
         rows.append(row)
 
@@ -216,19 +216,90 @@ def get_emotion_trials(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def get_eeg_matrix(df: pd.DataFrame) -> np.ndarray:
+def get_eeg_matrix(
+    df: pd.DataFrame,
+    strategy: str = "filter",
+    target_shape: Optional[Tuple] = None,
+) -> Tuple[np.ndarray, pd.DataFrame]:
     """
-    Stack all EEG tensors into a single array.
+    Stack all EEG tensors into a single numpy array, handling shape mismatches.
 
     Parameters
     ----------
     df : DataFrame with 'eeg_data' column
+    strategy : str
+        'filter'   – keep only trials matching the most common shape (default).
+                     Zero data distortion. Recommended for clean pipelines.
+        'truncate' – crop every trial to target_shape (or per-dim minimum).
+                     Keeps all trials, may lose time samples.
+        'pad'      – zero-pad every trial to target_shape (or per-dim maximum).
+                     Keeps all trials, introduces synthetic zeros.
+    target_shape : tuple, optional
+        Explicit target shape (excluding batch N dimension).
+        If None, inferred automatically per strategy.
 
     Returns
     -------
-    X : ndarray, shape (N, 12, 17, 14)
+    X       : ndarray, shape (N, ...)   — stacked EEG tensor
+    out_df  : DataFrame aligned row-for-row with X
+              (may be a filtered subset of df when strategy='filter')
     """
-    return np.stack(df["eeg_data"].values)   # (N, 12, 17, 14)
+    arrays = df["eeg_data"].values
+    shapes = [a.shape for a in arrays]
+    shape_counts = Counter(shapes)
+
+    # ── Fast path: all shapes identical ──────────────────────────────────────
+    if len(shape_counts) == 1:
+        return np.stack(arrays), df.copy().reset_index(drop=True)
+
+    # ── Diagnostic ───────────────────────────────────────────────────────────
+    print(f"\n[get_eeg_matrix] WARNING: {len(shape_counts)} distinct EEG shapes found:")
+    for sh, cnt in shape_counts.most_common():
+        pct = 100.0 * cnt / len(arrays)
+        print(f"    {str(sh):<20}  {cnt:>5,} trials  ({pct:.1f}%)")
+
+    most_common_shape = shape_counts.most_common(1)[0][0]
+
+    # ── Strategy: filter ─────────────────────────────────────────────────────
+    if strategy == "filter":
+        tgt = target_shape or most_common_shape
+        mask   = df["eeg_data"].apply(lambda a: a.shape == tgt)
+        kept   = df[mask].copy().reset_index(drop=True)
+        dropped = len(df) - len(kept)
+        print(f"[get_eeg_matrix] strategy=filter  →  target={tgt}  "
+              f"kept={len(kept):,}  dropped={dropped:,}\n")
+        return np.stack(kept["eeg_data"].values), kept
+
+    # ── Strategy: truncate / pad ──────────────────────────────────────────────
+    elif strategy in ("truncate", "pad"):
+        all_shapes = np.array(shapes)           # (N, ndim)
+        if target_shape is not None:
+            tgt = np.array(target_shape)
+        elif strategy == "truncate":
+            tgt = all_shapes.min(axis=0)        # per-dim minimum
+        else:                                   # pad
+            tgt = all_shapes.max(axis=0)        # per-dim maximum
+
+        def _resize(a: np.ndarray) -> np.ndarray:
+            # 1. Truncate to tgt along every dimension
+            slices = tuple(slice(0, int(t)) for t in tgt)
+            out = a[slices]
+            # 2. Zero-pad if still short (only relevant for 'pad' strategy)
+            pad_w = [(0, int(t) - s) for t, s in zip(tgt, out.shape)]
+            if any(p[1] > 0 for p in pad_w):
+                out = np.pad(out, pad_w, mode="constant", constant_values=0)
+            return out
+
+        print(f"[get_eeg_matrix] strategy={strategy}  →  target={tuple(tgt)}  "
+              f"trials={len(df):,}\n")
+        X = np.stack([_resize(a) for a in arrays])
+        return X, df.copy().reset_index(drop=True)
+
+    else:
+        raise ValueError(
+            f"Unknown strategy '{strategy}'. "
+            "Choose 'filter', 'truncate', or 'pad'."
+        )
 
 
 def get_labels(df: pd.DataFrame) -> np.ndarray:
@@ -236,10 +307,28 @@ def get_labels(df: pd.DataFrame) -> np.ndarray:
     Return subject ID labels as a 1-D integer array.
     Subject IDs are re-indexed to 0-based consecutive integers.
     """
-    ids      = df["subject_id"].values
-    unique   = sorted(np.unique(ids))
-    id2idx   = {v: i for i, v in enumerate(unique)}
+    ids    = df["subject_id"].values
+    unique = sorted(np.unique(ids))
+    id2idx = {v: i for i, v in enumerate(unique)}
     return np.array([id2idx[x] for x in ids], dtype=np.int64)
+
+
+def split_sessions(
+    df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split DataFrame into enrolment (sessions 1 & 2) and verification (session 3).
+
+    Returns
+    -------
+    enrol_df  : DataFrame  — sessions 1 and 2  (training / enrolment)
+    verif_df  : DataFrame  — session 3          (verification / test)
+    """
+    enrol = df[df["session"].isin([1, 2])].copy().reset_index(drop=True)
+    verif = df[df["session"] == 3].copy().reset_index(drop=True)
+    print(f"[split_sessions] Enrolment (sessions 1+2): {len(enrol):,} trials")
+    print(f"[split_sessions] Verification (session 3): {len(verif):,} trials")
+    return enrol, verif
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,33 +349,127 @@ def _print_summary(df: pd.DataFrame) -> None:
     print()
     img = df[df["stimuli_type"] == "IMAGE"]
     print(f"  Emotion trials (IMAGE): {len(img):,}")
-    print(f"    Arousal voted range : {img['arousal_voted'].min():.1f} – {img['arousal_voted'].max():.1f}")
-    print(f"    Valence voted range : {img['valence_voted'].min():.1f} – {img['valence_voted'].max():.1f}")
+    if len(img):
+        print(f"    Arousal voted range : {img['arousal_voted'].min():.1f} – {img['arousal_voted'].max():.1f}")
+        print(f"    Valence voted range : {img['valence_voted'].min():.1f} – {img['valence_voted'].max():.1f}")
+    print()
+    # EEG shape audit
+    shapes = Counter(df["eeg_data"].apply(lambda a: a.shape))
+    print(f"  EEG array shapes ({len(shapes)} distinct):")
+    for sh, cnt in shapes.most_common():
+        print(f"    {str(sh):<20}  {cnt:,} trials")
     print("══════════════════════════════════\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cache helper (save/load processed DataFrame)
+# Cache helper (save / load processed data)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_processed(df: pd.DataFrame, out_path: Path) -> None:
-    """Save parsed DataFrame (without eeg_data) + EEG tensor separately."""
+def save_processed(
+    df: pd.DataFrame,
+    out_path: Path,
+    strategy: str = "filter",
+) -> None:
+    """
+    Save parsed DataFrame + EEG tensor to disk, split by session role.
+
+    Produces:
+        <out_path>/
+            enrol_eeg.npy       EEG tensor  (N_enrol, ...)   sessions 1+2
+            enrol_meta.csv      metadata    (N_enrol rows)   sessions 1+2
+            verif_eeg.npy       EEG tensor  (N_verif, ...)   session 3
+            verif_meta.csv      metadata    (N_verif rows)   session 3
+            shape_report.txt    shape audit log
+
+    Parameters
+    ----------
+    df       : full DataFrame from load_arrc()
+    out_path : output directory (created if absent)
+    strategy : passed to get_eeg_matrix  ('filter' | 'truncate' | 'pad')
+    """
     out_path = Path(out_path)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # Save EEG arrays
-    X = get_eeg_matrix(df)
-    np.save(out_path / "eeg_tensor.npy", X)
+    # ── 1. Split by session ──────────────────────────────────────────────────
+    enrol_df, verif_df = split_sessions(df)
 
-    # Save metadata (drop heavy object column)
-    meta = df.drop(columns=["eeg_data"])
-    meta.to_csv(out_path / "metadata.csv", index=False)
-    print(f"Saved processed data to {out_path}")
+    # ── 2. Stack EEG tensors (handles shape mismatches) ─────────────────────
+    print("\n── Enrolment set ──")
+    X_enrol, enrol_aligned = get_eeg_matrix(enrol_df, strategy=strategy)
+
+    print("── Verification set ──")
+    # Use the same target shape as enrolment to ensure consistency
+    enrol_target = X_enrol.shape[1:]
+    X_verif, verif_aligned = get_eeg_matrix(
+        verif_df, strategy=strategy, target_shape=enrol_target
+    )
+
+    # ── 3. Persist ───────────────────────────────────────────────────────────
+    np.save(out_path / "enrol_eeg.npy",  X_enrol)
+    np.save(out_path / "verif_eeg.npy",  X_verif)
+
+    enrol_aligned.drop(columns=["eeg_data"]).to_csv(
+        out_path / "enrol_meta.csv", index=False
+    )
+    verif_aligned.drop(columns=["eeg_data"]).to_csv(
+        out_path / "verif_meta.csv", index=False
+    )
+
+    # ── 4. Shape report ──────────────────────────────────────────────────────
+    report_lines = [
+        "ARRC Processed Data — Shape Report",
+        "=" * 40,
+        f"strategy           : {strategy}",
+        f"enrol_eeg.npy      : {X_enrol.shape}",
+        f"enrol_meta.csv     : {len(enrol_aligned):,} rows",
+        f"verif_eeg.npy      : {X_verif.shape}",
+        f"verif_meta.csv     : {len(verif_aligned):,} rows",
+    ]
+    (out_path / "shape_report.txt").write_text("\n".join(report_lines))
+
+    print(f"\n✅ Saved to {out_path.resolve()}")
+    print(f"   enrol_eeg.npy  {X_enrol.shape}")
+    print(f"   verif_eeg.npy  {X_verif.shape}")
+    print(f"   enrol_meta.csv {len(enrol_aligned):,} rows")
+    print(f"   verif_meta.csv {len(verif_aligned):,} rows")
 
 
-def load_processed(proc_path: Path) -> Tuple[np.ndarray, pd.DataFrame]:
-    """Load cached processed data. Returns (X, metadata_df)."""
+def load_processed(
+    proc_path: Path,
+) -> Tuple[np.ndarray, pd.DataFrame, np.ndarray, pd.DataFrame]:
+    """
+    Load cached processed data.
+
+    Returns
+    -------
+    X_enrol      : ndarray  (N_enrol, ...)
+    enrol_meta   : DataFrame
+    X_verif      : ndarray  (N_verif, ...)
+    verif_meta   : DataFrame
+    """
     proc_path = Path(proc_path)
-    X    = np.load(proc_path / "eeg_tensor.npy")        # (N, 12, 17, 14)
-    meta = pd.read_csv(proc_path / "metadata.csv")
-    return X, meta
+    X_enrol    = np.load(proc_path / "enrol_eeg.npy")
+    X_verif    = np.load(proc_path / "verif_eeg.npy")
+    enrol_meta = pd.read_csv(proc_path / "enrol_meta.csv")
+    verif_meta = pd.read_csv(proc_path / "verif_meta.csv")
+    return X_enrol, enrol_meta, X_verif, verif_meta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    from pathlib import Path
+
+    # 1. Load full dataset
+    df = load_arrc(verbose=True)
+
+    # 2. Output directory
+    output_dir = Path("data/processed")
+
+    # 3. Save — 'filter' keeps only trials with the dominant EEG shape.
+    #    Switch to 'truncate' or 'pad' if you need all trials.
+    save_processed(df, output_dir, strategy="filter")
+
+    print(f"\n✅ Done! Files saved in: {output_dir.resolve()}")

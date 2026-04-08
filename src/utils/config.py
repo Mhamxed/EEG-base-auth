@@ -1,3 +1,12 @@
 from pathlib import Path
-# Define where your dataset lives
-ARRC_PATH = Path(__file__).parents[2] / "data" / "raw" / "ARRC.mat"
+
+# Project root (EEG-base-auth/)
+BASE_PATH = Path(__file__).resolve().parents[2]
+
+# Data folders
+DATA_PATH = BASE_PATH / "data"
+RAW_PATH = DATA_PATH / "raw"
+PROCESSED_PATH = DATA_PATH / "processed"
+
+# Dataset file
+ARRC_PATH = RAW_PATH / "ARRC.mat"
